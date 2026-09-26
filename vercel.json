@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/", "destination": "/world-model-proxy/sovereign-world-model/index.html" }
+  ]
+}
