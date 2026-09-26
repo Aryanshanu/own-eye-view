@@ -8,7 +8,10 @@ Sovereign World Model & live telemetry proxy.
   - `src/index.js`: Worker entrypoint caching live telemetry feed.
   - `wrangler.jsonc`: Cloudflare Workers configuration.
 - **`world-model-proxy/sovereign-world-model/`**: Client dashboard with:
-  - MapLibre GL for map and live flight telemetry visualization.
+  - MapLibre GL rendering the [OpenFreeMap "Liberty"](https://openfreemap.org) style — free, no API key,
+    full OpenStreetMap detail (roads, buildings, land use, water, place labels) plus extruded 3D buildings.
+  - Live flight telemetry as rotated, altitude-colored aircraft icons with a click-for-details popup.
+  - Place search via OpenStreetMap's Nominatim geocoder (no key required).
   - DuckDB-Wasm for local client-side SQL analytics.
   - In-browser AI models via `@xenova/transformers`.
 

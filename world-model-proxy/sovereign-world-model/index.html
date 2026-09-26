@@ -24,12 +24,48 @@
         button { width: 100%; background: #00ffcc; color: #060913; border: none; padding: 8px; font-weight: bold; cursor: pointer; margin-top: 5px; border-radius: 4px; }
         button:hover { background: #00ccaa; }
         button:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+        /* Search box (OSM/Nominatim place lookup) */
+        #search-box {
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%); z-index: 10;
+            width: 320px; max-width: calc(100vw - 40px);
+        }
+        #search-input {
+            width: 100%; background: rgba(6, 9, 19, 0.9); border: 1px solid #00ffcc; color: #fff;
+            padding: 10px 14px; border-radius: 24px; font-family: 'Courier New', monospace;
+            box-sizing: border-box; backdrop-filter: blur(10px); outline: none;
+        }
+        #search-results {
+            margin-top: 6px; background: rgba(6, 9, 19, 0.95); border: 1px solid #00ffcc33;
+            border-radius: 8px; overflow: hidden; display: none;
+        }
+        #search-results div { padding: 8px 14px; font-size: 12px; cursor: pointer; border-bottom: 1px solid #00ffcc22; }
+        #search-results div:last-child { border-bottom: none; }
+        #search-results div:hover { background: #00ffcc22; }
+
+        /* Aircraft click popup */
+        .maplibregl-popup-content {
+            background: rgba(6, 9, 19, 0.95) !important; color: #00ffcc !important;
+            border: 1px solid #00ffcc; border-radius: 6px; font-family: 'Courier New', monospace;
+            font-size: 12px; padding: 10px 12px !important;
+        }
+        .maplibregl-popup-tip { border-top-color: rgba(6,9,19,0.95) !important; border-bottom-color: rgba(6,9,19,0.95) !important; }
+        .maplibregl-popup-close-button { color: #00ffcc; font-size: 16px; }
+        #popup-title { color: #fff; font-weight: bold; margin-bottom: 4px; }
+        #legend {
+            position: absolute; bottom: 24px; left: 20px; z-index: 10; display: flex; gap: 14px;
+            background: rgba(6, 9, 19, 0.9); border: 1px solid #00ffcc33; border-radius: 8px;
+            padding: 8px 14px; font-size: 11px; backdrop-filter: blur(10px);
+        }
+        #legend span { display: flex; align-items: center; gap: 5px; }
+        #legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
     </style>
 </head>
 <body>
 
     <div id="hud">
         <h3 style="margin-top:0; color:#00ffcc; letter-spacing: 1px; font-size: 16px; border-bottom: 1px solid #00ffcc; padding-bottom: 8px;">📡 WORLD MODEL MATRIX</h3>
+        <div style="font-size: 11px; color: #777; margin: -6px 0 10px;">Map &amp; buildings: OpenStreetMap / OpenFreeMap · Flights: OpenSky</div>
         <div class="stat"><span>🧠 AI Node (TinyLlama):</span> <span id="ai-status" class="value">Initializing...</span></div>
         <div class="stat"><span>💾 Memory DB:</span> <span id="db-status" class="value">0 Records</span></div>
         <div class="stat"><span>📡 Proxy Feed:</span> <span id="feed-status" class="value">Standby</span></div>
@@ -40,6 +76,17 @@
             <button id="ai-btn" onclick="queryAI()" disabled>EXECUTE QUERY</button>
             <div id="ai-response">Awaiting AI initialization...</div>
         </div>
+    </div>
+
+    <div id="search-box">
+        <input type="text" id="search-input" placeholder="🔍 Search a place (OpenStreetMap)...">
+        <div id="search-results"></div>
+    </div>
+
+    <div id="legend">
+        <span><i style="background:#00ff66"></i> Low altitude</span>
+        <span><i style="background:#00ffcc"></i> Cruise</span>
+        <span><i style="background:#ff9900"></i> High altitude</span>
     </div>
 
     <div id="map"></div>
@@ -70,8 +117,8 @@
 
         // --- STATE ---
         let db, conn;
-        let telemetryBuffer = [];
         let activeNow = 0; // aircraft in the most recent snapshot
+        let totalTracked = 0, uniqueFlights = 0; // rolling-window stats, read back from DuckDB
         const MAX_ROWS = 5000; // Kept low to guarantee no browser crashes
         let aiGenerator = null;
 
@@ -86,31 +133,154 @@
             await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
             URL.revokeObjectURL(worker_url);
             conn = await db.connect();
-            
-            await conn.query(`CREATE TABLE IF NOT EXISTS telemetry (id VARCHAR, lat DOUBLE, lon DOUBLE, alt DOUBLE, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+
+            // `seq` is an insert-order counter so old rows can be trimmed cheaply,
+            // without re-inserting the whole rolling window on every poll.
+            await conn.query(`CREATE SEQUENCE IF NOT EXISTS telemetry_seq START 1`);
+            await conn.query(`CREATE TABLE IF NOT EXISTS telemetry (
+                seq BIGINT DEFAULT nextval('telemetry_seq'),
+                id VARCHAR, lat DOUBLE, lon DOUBLE, alt DOUBLE,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )`);
             document.getElementById('db-status').innerText = "DuckDB-Wasm Ready";
         }
 
         // --- 2. INITIALIZE MAP ---
+        // OpenFreeMap "Liberty": free, no API key, unlimited — full OpenStreetMap detail
+        // (roads, buildings, land use, water, POI/place labels), unlike the blank demotiles style.
         const map = new maplibregl.Map({
             container: 'map',
-            style: 'https://demotiles.maplibre.org/style.json', // Free, reliable baseline style
+            style: 'https://tiles.openfreemap.org/styles/liberty',
             center: [78.0, 15.0], // Centered on the proxy's OpenSky bounding box (South-Central India)
-            zoom: 6,
-            pitch: 45
+            zoom: 6.5,
+            pitch: 45,
+            attributionControl: { compact: true }
         });
         map.addControl(new maplibregl.NavigationControl(), 'top-right');
+        map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
+        map.addControl(new maplibregl.FullscreenControl(), 'top-right');
+        map.addControl(new maplibregl.GeolocateControl({ positionOptions: { enableHighAccuracy: true } }), 'top-right');
 
-        // Add a layer to render the aircraft as dots
+        // Draw a small triangular "plane" icon in code (no external asset needed).
+        // Registered as an SDF image so `icon-color` can recolor it per-aircraft (by altitude).
+        function addPlaneIcon() {
+            const size = 32;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.moveTo(size * 0.5, 0);
+            ctx.lineTo(size * 0.85, size * 0.9);
+            ctx.lineTo(size * 0.5, size * 0.68);
+            ctx.lineTo(size * 0.15, size * 0.9);
+            ctx.closePath();
+            ctx.fill();
+            map.addImage('plane-icon', ctx.getImageData(0, 0, size, size), { sdf: true });
+        }
+
+        // Google-Maps-style extruded 3D buildings, added under the style's first label
+        // layer so place names stay readable. Reads the building source/source-layer
+        // straight off the loaded style instead of hardcoding names, so it keeps working
+        // if OpenFreeMap changes its schema.
+        function add3DBuildings() {
+            const style = map.getStyle();
+            const buildingRef = style.layers.find(l => l.type === 'fill' && l['source-layer'] === 'building');
+            if (!buildingRef) return; // style schema changed or zoomed layer not present; skip gracefully
+            const labelLayerId = style.layers.find(l => l.type === 'symbol' && l.layout && l.layout['text-field'])?.id;
+            map.addLayer({
+                id: '3d-buildings',
+                type: 'fill-extrusion',
+                source: buildingRef.source,
+                'source-layer': buildingRef['source-layer'],
+                minzoom: 13,
+                paint: {
+                    'fill-extrusion-color': '#4a5568',
+                    'fill-extrusion-height': ['coalesce', ['get', 'render_height'], ['get', 'height'], 8],
+                    'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], ['get', 'min_height'], 0],
+                    'fill-extrusion-opacity': 0.75
+                }
+            }, labelLayerId);
+        }
+
+        const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: false, offset: 14 });
+
         map.on('load', () => {
+            addPlaneIcon();
+            add3DBuildings();
+
             map.addSource('telemetry', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
             map.addLayer({
                 id: 'telemetry-points',
-                type: 'circle',
+                type: 'symbol',
                 source: 'telemetry',
-                paint: { 'circle-radius': 4, 'circle-color': '#00ffcc', 'circle-stroke-width': 1, 'circle-stroke-color': '#060913' }
+                layout: {
+                    'icon-image': 'plane-icon',
+                    'icon-size': 0.7,
+                    'icon-rotate': ['get', 'track'],
+                    'icon-rotation-alignment': 'map',
+                    'icon-allow-overlap': true,
+                    'icon-ignore-placement': true
+                },
+                paint: {
+                    // Colored by altitude: green (low) -> cyan (cruise) -> orange (high)
+                    'icon-color': [
+                        'interpolate', ['linear'], ['get', 'alt'],
+                        0, '#00ff66',
+                        6000, '#00ffcc',
+                        12000, '#ff9900'
+                    ],
+                    'icon-halo-color': '#060913',
+                    'icon-halo-width': 1.2
+                }
             });
+
+            map.on('click', 'telemetry-points', (e) => {
+                const p = e.features[0].properties;
+                popup.setLngLat(e.features[0].geometry.coordinates.slice())
+                    .setHTML(`<div id="popup-title">✈ ${p.id}</div>` +
+                        `Altitude: ${Math.round(p.alt)} m<br>` +
+                        `Speed: ${p.speed ? Math.round(p.speed * 3.6) + ' km/h' : 'n/a'}<br>` +
+                        `Heading: ${p.track != null ? Math.round(p.track) + '°' : 'n/a'}<br>` +
+                        `Origin: ${p.country || 'Unknown'}`)
+                    .addTo(map);
+            });
+            map.on('mouseenter', 'telemetry-points', () => map.getCanvas().style.cursor = 'pointer');
+            map.on('mouseleave', 'telemetry-points', () => map.getCanvas().style.cursor = '');
+
             startTelemetryLoop();
+        });
+
+        // --- OSM PLACE SEARCH (Nominatim) ---
+        // Free, no API key, part of the OpenStreetMap project — lets you jump anywhere on the map.
+        const searchInput = document.getElementById('search-input');
+        const searchResults = document.getElementById('search-results');
+        let searchTimer = null;
+        searchInput.addEventListener('input', () => {
+            clearTimeout(searchTimer);
+            const q = searchInput.value.trim();
+            if (q.length < 3) { searchResults.style.display = 'none'; return; }
+            searchTimer = setTimeout(async () => {
+                try {
+                    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=5&q=${encodeURIComponent(q)}`;
+                    const res = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+                    const places = await res.json();
+                    searchResults.innerHTML = '';
+                    places.forEach(place => {
+                        const row = document.createElement('div');
+                        row.textContent = place.display_name;
+                        row.onclick = () => {
+                            map.flyTo({ center: [parseFloat(place.lon), parseFloat(place.lat)], zoom: 12, pitch: 45 });
+                            searchResults.style.display = 'none';
+                            searchInput.value = place.display_name;
+                        };
+                        searchResults.appendChild(row);
+                    });
+                    searchResults.style.display = places.length ? 'block' : 'none';
+                } catch (e) {
+                    console.error("Place search failed:", e);
+                }
+            }, 400); // debounce so we don't hammer Nominatim's free tier
         });
 
         // --- 3. INITIALIZE AI (TinyLlama-1.1B) ---
@@ -151,38 +321,45 @@
                     const data = await response.json();
                     
                     if (data.states && Array.isArray(data.states)) {
-                        // Process OpenSky data: [icao24, callsign, origin_country, time_position, last_contact, longitude, latitude, baro_altitude, ...]
+                        // Process OpenSky data: [icao24, callsign, origin_country, time_position, last_contact,
+                        //                        longitude, latitude, baro_altitude, on_ground, velocity, true_track, ...]
                         const freshBatch = data.states.map(s => ({
                             id: s[1]?.trim() || s[0], // callsign or icao24
+                            country: s[2],
                             lon: s[5],
                             lat: s[6],
-                            alt: s[7]
+                            alt: s[7],
+                            speed: s[9],
+                            track: s[10]
                         })).filter(s => s.lat !== null && s.lon !== null); // Filter invalid coords
-
-                        // Rolling Window Management
                         activeNow = freshBatch.length;
-                        telemetryBuffer.push(...freshBatch);
-                        if (telemetryBuffer.length > MAX_ROWS) {
-                            telemetryBuffer = telemetryBuffer.slice(-MAX_ROWS);
-                        }
 
-                        // Update DuckDB (Clear and reload for simplicity in Wasm)
-                        await conn.query(`DELETE FROM telemetry`);
-                        if (telemetryBuffer.length > 0) {
-                            const values = telemetryBuffer.map(r => `('${String(r.id).replace(/'/g, "''")}', ${r.lat}, ${r.lon}, ${r.alt || 0}, CURRENT_TIMESTAMP)`).join(', ');
-                            await conn.query(`INSERT INTO telemetry VALUES ${values}`);
+                        // Append only the new batch (not the whole rolling window) so the SQL
+                        // stays small and fast even as the window grows.
+                        if (freshBatch.length > 0) {
+                            const values = freshBatch.map(r =>
+                                `('${String(r.id).replace(/'/g, "''")}', ${r.lat}, ${r.lon}, ${r.alt || 0}, CURRENT_TIMESTAMP)`
+                            ).join(', ');
+                            await conn.query(`INSERT INTO telemetry (id, lat, lon, alt, timestamp) VALUES ${values}`);
                         }
+                        // Trim anything older than MAX_ROWS off the front of the window by insert order.
+                        await conn.query(`DELETE FROM telemetry WHERE seq <= (SELECT COALESCE(MAX(seq), 0) FROM telemetry) - ${MAX_ROWS}`);
 
-                        // Update Map (latest snapshot only, so each aircraft is drawn once)
+                        const statsResult = await conn.query(`SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_flights FROM telemetry`);
+                        const stats = statsResult.toArray()[0];
+                        totalTracked = Number(stats.total);
+                        uniqueFlights = Number(stats.unique_flights);
+
+                        // Update Map (latest snapshot only, so each aircraft is drawn once, with a rotated icon)
                         const features = freshBatch.map(t => ({
                             type: 'Feature',
                             geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
-                            properties: { id: t.id }
+                            properties: { id: t.id, alt: t.alt || 0, speed: t.speed, track: t.track, country: t.country }
                         }));
                         map.getSource('telemetry').setData({ type: 'FeatureCollection', features });
 
                         // Update HUD
-                        document.getElementById('db-status').innerText = `${telemetryBuffer.length} Tracks (Max ${MAX_ROWS})`;
+                        document.getElementById('db-status').innerText = `${totalTracked} Tracks (Max ${MAX_ROWS})`;
                         document.getElementById('feed-status').innerText = DEMO_MODE ? `DEMO DATA (${activeNow} simulated)` : `Streaming Live (${activeNow} aircraft)`;
                         document.getElementById('feed-status').classList.remove('error');
                         document.getElementById('feed-status').classList.add('highlight');
@@ -212,11 +389,9 @@
             btn.disabled = true;
 
             try {
-                // 1. Get context from DuckDB
-                const countResult = await conn.query(`SELECT COUNT(*) as total, COUNT(DISTINCT id) as unique_flights FROM telemetry`);
-                const stats = countResult.toArray()[0];
+                // 1. Build context from the stats already read back from DuckDB on the last poll
                 const source = DEMO_MODE ? 'NOTE: this is simulated demo data, not real flights. ' : '';
-                const context = `${source}${activeNow} flights are currently active in the latest snapshot. The rolling history holds ${stats.total} total data points representing ${stats.unique_flights} unique flights.`;
+                const context = `${source}${activeNow} flights are currently active in the latest snapshot. The rolling history holds ${totalTracked} total data points representing ${uniqueFlights} unique flights.`;
 
                 // 2. Format prompt specifically for TinyLlama
                 const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
