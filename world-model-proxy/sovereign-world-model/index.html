@@ -389,22 +389,37 @@
             btn.disabled = true;
 
             try {
-                // 1. Build context from the stats already read back from DuckDB on the last poll
+                // 1. Build context from the stats already read back from DuckDB on the last poll.
+                // The feed is only current position snapshots (OpenSky state vectors) — no routes,
+                // origins or destinations — so the model is told plainly not to invent those.
                 const source = DEMO_MODE ? 'NOTE: this is simulated demo data, not real flights. ' : '';
-                const context = `${source}${activeNow} flights are currently active in the latest snapshot. The rolling history holds ${totalTracked} total data points representing ${uniqueFlights} unique flights.`;
+                const context = `${source}${activeNow} flights are currently active in the latest snapshot. ` +
+                    `The rolling history holds ${totalTracked} total data points representing ${uniqueFlights} unique flights. ` +
+                    `You only have each aircraft's current position and altitude — no flight routes, origin airports, or destination airports. ` +
+                    `If asked about a specific route (e.g. "flights from X to Y"), say plainly that this data has no route information.`;
 
                 // 2. Format prompt specifically for TinyLlama
                 const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
 
-                // 3. Generate response
-                const result = await aiGenerator(promptText, { max_new_tokens: 100, temperature: 0.1 });
-                
+                // 3. Generate response. Retry once with a smaller/greedy config if the first
+                // attempt fails (WASM inference can run out of memory on constrained devices).
+                let result;
+                try {
+                    result = await aiGenerator(promptText, { max_new_tokens: 100, temperature: 0.1, do_sample: false });
+                } catch (firstErr) {
+                    console.warn("AI generation failed, retrying with a smaller config:", firstErr);
+                    result = await aiGenerator(promptText, { max_new_tokens: 40, do_sample: false });
+                }
+
                 // Extract the generated text
                 const answer = result[0].generated_text.split('<|assistant|>\n').pop().trim();
-                responseDiv.innerText = answer;
+                responseDiv.innerText = answer || "(empty response)";
                 responseDiv.style.color = "#00ffcc";
             } catch (err) {
-                responseDiv.innerText = "AI Query Failed. Check console (F12).";
+                // Show the real error inline (not just in the console) so it's visible on
+                // mobile too, and so it can be reported back without opening devtools.
+                const detail = (err && err.message) ? err.message : String(err);
+                responseDiv.innerText = `AI Query Failed: ${detail}`;
                 responseDiv.style.color = "#ff3333";
                 console.error("AI Query Error:", err);
             } finally {
