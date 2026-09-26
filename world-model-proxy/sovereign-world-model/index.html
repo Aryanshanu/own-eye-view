@@ -106,7 +106,7 @@
         // ⚠️ REPLACE THIS WITH YOUR ACTUAL WORKER URL FROM PHASE 1 ⚠️
         // `npm run deploy` prints it: https://world-model-proxy.<your-subdomain>.workers.dev
         // It can also be overridden without a redeploy: https://<your-site>/?proxy=<worker-url>
-        const DEFAULT_PROXY_URL = "https://world-model-proxy.YOUR-SUBDOMAIN.workers.dev";
+        const DEFAULT_PROXY_URL = "https://world-model-proxy.ganesh-world-model-proxy.workers.dev";
         const PROXY_WORKER_URL = new URLSearchParams(location.search).get('proxy') || DEFAULT_PROXY_URL;
         const PROXY_CONFIGURED = !PROXY_WORKER_URL.includes('YOUR-SUBDOMAIN');
         // ?demo=1 asks the worker for simulated flights (fallback if OpenSky blocks the worker)
