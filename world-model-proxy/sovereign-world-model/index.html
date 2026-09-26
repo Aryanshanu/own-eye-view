@@ -665,7 +665,13 @@
         async function fetchSatelliteTles() {
             try {
                 const res = await fetch(`${PROXY_WORKER_URL.replace(/\/$/, '')}/satellites`);
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                if (!res.ok) {
+                    // The worker's error body carries the real upstream reason (e.g. CelesTrak
+                    // rate-limiting or blocking the request) — show that instead of just the
+                    // generic HTTP status, the same mistake already fixed for the flight feed.
+                    const body = await res.json().catch(() => ({}));
+                    throw new Error(body.details || `HTTP ${res.status}`);
+                }
                 const data = await res.json();
                 satellitesTleSet = (data.satellites || []).map(s => {
                     try {
