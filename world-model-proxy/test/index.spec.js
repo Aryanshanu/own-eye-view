@@ -4,7 +4,7 @@ import {
 	waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import worker, { OPENSKY_URL } from "../src";
+import worker, { OPENSKY_URL, demoStates } from "../src";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -65,5 +65,26 @@ describe("world-model-proxy", () => {
 		const response = await callWorker(new Request("http://example.com/down"));
 		expect(response.status).toBe(502);
 		expect(await response.json()).toMatchObject({ error: "Upstream fetch failed" });
+	});
+
+	it("serves simulated data inside the bounding box with ?demo=1", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const response = await callWorker(new Request("http://example.com/?demo=1"));
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(response.headers.get("X-Data-Source")).toBe("demo");
+		const data = await response.json();
+		expect(data.states).toHaveLength(24);
+		for (const s of data.states) {
+			expect(s[6]).toBeGreaterThanOrEqual(12);
+			expect(s[6]).toBeLessThanOrEqual(18);
+			expect(s[5]).toBeGreaterThanOrEqual(76);
+			expect(s[5]).toBeLessThanOrEqual(80);
+		}
+	});
+
+	it("moves demo aircraft over time", () => {
+		const a = demoStates(0).states[0];
+		const b = demoStates(10_000).states[0];
+		expect([a[5], a[6]]).not.toEqual([b[5], b[6]]);
 	});
 });

@@ -35,6 +35,10 @@ Set `DEFAULT_PROXY_URL` inside `index.html` to your deployed Worker URL. `npm ru
 it looks like `https://world-model-proxy.<your-subdomain>.workers.dev` (the name comes from `wrangler.jsonc`).
 To try a URL without editing the file, open the page with `?proxy=<worker-url>`.
 
+If OpenSky blocks or rate-limits the worker (the console shows `Proxy failed: HTTP 429` or `403`),
+add `?demo=1` to the page URL. The worker then returns 24 simulated aircraft over the bounding box,
+and the panel shows "DEMO DATA" so it is never mistaken for live traffic.
+
 ### 3. Deploy to Vercel
 
 Import the repo in Vercel with the default settings (no framework, no build command).

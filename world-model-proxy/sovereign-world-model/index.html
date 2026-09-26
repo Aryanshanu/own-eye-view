@@ -62,6 +62,11 @@
         const DEFAULT_PROXY_URL = "https://world-model-proxy.YOUR-SUBDOMAIN.workers.dev";
         const PROXY_WORKER_URL = new URLSearchParams(location.search).get('proxy') || DEFAULT_PROXY_URL;
         const PROXY_CONFIGURED = !PROXY_WORKER_URL.includes('YOUR-SUBDOMAIN');
+        // ?demo=1 asks the worker for simulated flights (fallback if OpenSky blocks the worker)
+        const DEMO_MODE = new URLSearchParams(location.search).get('demo') === '1';
+        const FEED_URL = DEMO_MODE
+            ? `${PROXY_WORKER_URL}${PROXY_WORKER_URL.includes('?') ? '&' : '?'}demo=1`
+            : PROXY_WORKER_URL;
 
         // --- STATE ---
         let db, conn;
@@ -141,7 +146,7 @@
             const poll = async () => {
                 try {
                     if (!conn) return; // DuckDB still booting; next tick will catch up
-                    const response = await fetch(PROXY_WORKER_URL);
+                    const response = await fetch(FEED_URL);
                     if (!response.ok) throw new Error(`Proxy failed: HTTP ${response.status}`);
                     const data = await response.json();
                     
@@ -178,7 +183,7 @@
 
                         // Update HUD
                         document.getElementById('db-status').innerText = `${telemetryBuffer.length} Tracks (Max ${MAX_ROWS})`;
-                        document.getElementById('feed-status').innerText = `Streaming Live (${activeNow} aircraft)`;
+                        document.getElementById('feed-status').innerText = DEMO_MODE ? `DEMO DATA (${activeNow} simulated)` : `Streaming Live (${activeNow} aircraft)`;
                         document.getElementById('feed-status').classList.remove('error');
                         document.getElementById('feed-status').classList.add('highlight');
                     }
@@ -210,7 +215,8 @@
                 // 1. Get context from DuckDB
                 const countResult = await conn.query(`SELECT COUNT(*) as total, COUNT(DISTINCT id) as unique_flights FROM telemetry`);
                 const stats = countResult.toArray()[0];
-                const context = `${activeNow} flights are currently active in the latest live snapshot. The rolling history holds ${stats.total} total data points representing ${stats.unique_flights} unique flights.`;
+                const source = DEMO_MODE ? 'NOTE: this is simulated demo data, not real flights. ' : '';
+                const context = `${source}${activeNow} flights are currently active in the latest snapshot. The rolling history holds ${stats.total} total data points representing ${stats.unique_flights} unique flights.`;
 
                 // 2. Format prompt specifically for TinyLlama
                 const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
