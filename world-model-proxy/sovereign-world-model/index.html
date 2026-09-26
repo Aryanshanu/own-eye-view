@@ -75,9 +75,9 @@
 
         <div style="margin-top: 15px; border-top: 1px solid #00ffcc; padding-top: 10px;">
             <div style="font-size: 12px; margin-bottom: 5px;">Ask the AI about the data:</div>
-            <input type="text" id="ai-input" placeholder="e.g., How many flights are active?" disabled>
-            <button id="ai-btn" onclick="queryAI()" disabled>EXECUTE QUERY</button>
-            <div id="ai-response">Awaiting AI initialization...</div>
+            <input type="text" id="ai-input" placeholder="e.g., How many flights are active?">
+            <button id="ai-btn" onclick="queryAI()">EXECUTE QUERY</button>
+            <div id="ai-response">Ask now — the hosted AI (if configured) answers right away; local AI needs its one-time download to finish first (see status above).</div>
         </div>
     </div>
 
@@ -384,9 +384,13 @@
                 
                 document.getElementById('ai-status').innerText = "Online (Local Wasm)";
                 document.getElementById('ai-status').classList.add('highlight');
-                document.getElementById('ai-input').disabled = false;
-                document.getElementById('ai-btn').disabled = false;
-                document.getElementById('ai-response').innerText = "AI Ready. Ask a question.";
+                // Only overwrite the response box if it still shows the original placeholder —
+                // don't clobber an answer the user already got from the hosted AI while this
+                // was downloading in the background.
+                const responseDiv = document.getElementById('ai-response');
+                if (responseDiv.innerText.startsWith('Ask now —')) {
+                    responseDiv.innerText = "Local AI ready too. Ask a question.";
+                }
             } catch (err) {
                 const detail = (err && err.message) ? err.message : String(err);
                 document.getElementById('ai-status').innerText = "AI Load Failed";
@@ -884,9 +888,12 @@
         };
 
         // --- BOOT SEQUENCE ---
-        window.addEventListener('DOMContentLoaded', async () => {
-            await initDB();
-            await initAI();
+        // Independent of each other (querying doesn't need DuckDB ready, and DuckDB doesn't
+        // need the AI model) — run them in parallel instead of one after the other, so a slow
+        // TinyLlama download doesn't also delay the map/database coming up, and vice versa.
+        window.addEventListener('DOMContentLoaded', () => {
+            initDB();
+            initAI();
         });
     </script>
 </body>
