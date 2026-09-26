@@ -30,7 +30,7 @@
 
     <div id="hud">
         <h3 style="margin-top:0; color:#00ffcc; letter-spacing: 1px; font-size: 16px; border-bottom: 1px solid #00ffcc; padding-bottom: 8px;">📡 WORLD MODEL MATRIX</h3>
-        <div class="stat"><span>🧠 AI Node (Qwen2.5):</span> <span id="ai-status" class="value">Initializing...</span></div>
+        <div class="stat"><span>🧠 AI Node (TinyLlama):</span> <span id="ai-status" class="value">Initializing...</span></div>
         <div class="stat"><span>💾 Memory DB:</span> <span id="db-status" class="value">0 Records</span></div>
         <div class="stat"><span>📡 Proxy Feed:</span> <span id="feed-status" class="value">Standby</span></div>
         
@@ -57,11 +57,21 @@
         env.useBrowserCache = true;
         
         // ⚠️ REPLACE THIS WITH YOUR ACTUAL WORKER URL FROM PHASE 1 ⚠️
-        const PROXY_WORKER_URL = "https://ganesh-world-model-proxy.yourname.workers.dev";  
+        // `npm run deploy` prints it: https://world-model-proxy.<your-subdomain>.workers.dev
+        // It can also be overridden without a redeploy: https://<your-site>/?proxy=<worker-url>
+        const DEFAULT_PROXY_URL = "https://world-model-proxy.YOUR-SUBDOMAIN.workers.dev";
+        const PROXY_WORKER_URL = new URLSearchParams(location.search).get('proxy') || DEFAULT_PROXY_URL;
+        const PROXY_CONFIGURED = !PROXY_WORKER_URL.includes('YOUR-SUBDOMAIN');
+        // ?demo=1 asks the worker for simulated flights (fallback if OpenSky blocks the worker)
+        const DEMO_MODE = new URLSearchParams(location.search).get('demo') === '1';
+        const FEED_URL = DEMO_MODE
+            ? `${PROXY_WORKER_URL}${PROXY_WORKER_URL.includes('?') ? '&' : '?'}demo=1`
+            : PROXY_WORKER_URL;
 
         // --- STATE ---
         let db, conn;
         let telemetryBuffer = [];
+        let activeNow = 0; // aircraft in the most recent snapshot
         const MAX_ROWS = 5000; // Kept low to guarantee no browser crashes
         let aiGenerator = null;
 
@@ -85,7 +95,7 @@
         const map = new maplibregl.Map({
             container: 'map',
             style: 'https://demotiles.maplibre.org/style.json', // Free, reliable baseline style
-            center: [8.5, 47.3], // Centered on the OpenSky bounding box (Switzerland/Europe)
+            center: [78.0, 15.0], // Centered on the proxy's OpenSky bounding box (South-Central India)
             zoom: 6,
             pitch: 45
         });
@@ -103,14 +113,14 @@
             startTelemetryLoop();
         });
 
-        // --- 3. INITIALIZE AI (Qwen2.5-0.5B) ---
+        // --- 3. INITIALIZE AI (TinyLlama-1.1B) ---
         async function initAI() {
             try {
                 document.getElementById('ai-status').innerText = "Downloading TinyLlama (~600MB)...";
-                // Using Qwen2.5-0.5B-Instruct: A highly capable, tiny Chinese open-source model
+                // Transformers.js v2 runs on WebAssembly (CPU); it has no WebGPU backend
                 aiGenerator = await pipeline('text-generation', 'Xenova/TinyLlama-1.1B-Chat-v1.0');
                 
-                document.getElementById('ai-status').innerText = "Online (Local WebGPU/Wasm)";
+                document.getElementById('ai-status').innerText = "Online (Local Wasm)";
                 document.getElementById('ai-status').classList.add('highlight');
                 document.getElementById('ai-input').disabled = false;
                 document.getElementById('ai-btn').disabled = false;
@@ -125,12 +135,19 @@
 
         // --- 4. TELEMETRY LOOP (Rolling Window) ---
         async function startTelemetryLoop() {
+            if (!PROXY_CONFIGURED) {
+                document.getElementById('feed-status').innerText = "Proxy URL not set";
+                document.getElementById('feed-status').classList.add('error');
+                console.error("Set DEFAULT_PROXY_URL in index.html, or open this page with ?proxy=<your worker URL>");
+                return;
+            }
             document.getElementById('feed-status').innerText = "Connecting...";
-            
-            setInterval(async () => {
+
+            const poll = async () => {
                 try {
-                    const response = await fetch(PROXY_WORKER_URL);
-                    if (!response.ok) throw new Error("Proxy failed");
+                    if (!conn) return; // DuckDB still booting; next tick will catch up
+                    const response = await fetch(FEED_URL);
+                    if (!response.ok) throw new Error(`Proxy failed: HTTP ${response.status}`);
                     const data = await response.json();
                     
                     if (data.states && Array.isArray(data.states)) {
@@ -143,6 +160,7 @@
                         })).filter(s => s.lat !== null && s.lon !== null); // Filter invalid coords
 
                         // Rolling Window Management
+                        activeNow = freshBatch.length;
                         telemetryBuffer.push(...freshBatch);
                         if (telemetryBuffer.length > MAX_ROWS) {
                             telemetryBuffer = telemetryBuffer.slice(-MAX_ROWS);
@@ -151,12 +169,12 @@
                         // Update DuckDB (Clear and reload for simplicity in Wasm)
                         await conn.query(`DELETE FROM telemetry`);
                         if (telemetryBuffer.length > 0) {
-                            const values = telemetryBuffer.map(r => `('${r.id}', ${r.lat}, ${r.lon}, ${r.alt || 0})`).join(', ');
+                            const values = telemetryBuffer.map(r => `('${String(r.id).replace(/'/g, "''")}', ${r.lat}, ${r.lon}, ${r.alt || 0}, CURRENT_TIMESTAMP)`).join(', ');
                             await conn.query(`INSERT INTO telemetry VALUES ${values}`);
                         }
 
-                        // Update Map
-                        const features = telemetryBuffer.map(t => ({
+                        // Update Map (latest snapshot only, so each aircraft is drawn once)
+                        const features = freshBatch.map(t => ({
                             type: 'Feature',
                             geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
                             properties: { id: t.id }
@@ -165,15 +183,20 @@
 
                         // Update HUD
                         document.getElementById('db-status').innerText = `${telemetryBuffer.length} Tracks (Max ${MAX_ROWS})`;
-                        document.getElementById('feed-status').innerText = "Streaming Live";
+                        document.getElementById('feed-status').innerText = DEMO_MODE ? `DEMO DATA (${activeNow} simulated)` : `Streaming Live (${activeNow} aircraft)`;
+                        document.getElementById('feed-status').classList.remove('error');
                         document.getElementById('feed-status').classList.add('highlight');
                     }
                 } catch (e) {
                     document.getElementById('feed-status').innerText = "Proxy Error";
+                    document.getElementById('feed-status').classList.remove('highlight');
                     document.getElementById('feed-status').classList.add('error');
                     console.error("Telemetry Error:", e);
                 }
-            }, 10000); // 10-second poll
+            };
+
+            poll();
+            setInterval(poll, 10000); // 10-second poll
         }
 
         // --- 5. AI QUERY FUNCTION ---
@@ -192,7 +215,8 @@
                 // 1. Get context from DuckDB
                 const countResult = await conn.query(`SELECT COUNT(*) as total, COUNT(DISTINCT id) as unique_flights FROM telemetry`);
                 const stats = countResult.toArray()[0];
-                const context = `Current database has ${stats.total} total data points representing ${stats.unique_flights} unique flights.`;
+                const source = DEMO_MODE ? 'NOTE: this is simulated demo data, not real flights. ' : '';
+                const context = `${source}${activeNow} flights are currently active in the latest snapshot. The rolling history holds ${stats.total} total data points representing ${stats.unique_flights} unique flights.`;
 
                 // 2. Format prompt specifically for TinyLlama
                 const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
