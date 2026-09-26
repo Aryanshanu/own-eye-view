@@ -4,36 +4,44 @@ Sovereign World Model & live telemetry proxy.
 
 ## Project Structure
 
-- **`world-model-proxy/`**: Cloudflare Worker proxying and streaming several public data feeds.
+- **`world-model-proxy/`**: Cloudflare Worker proxying public data feeds and brokering the hosted AI.
   - `src/index.js`:
-    - `GET /` — the original HTTP endpoint: one cached OpenSky snapshot, CORS-enabled (10s edge cache).
-    - `GET /live` (WebSocket) — a `LiveFeedHub` Durable Object that polls flights (OpenSky),
-      hazards (USGS earthquakes, NOAA weather alerts, NASA EONET wildfires/storms/volcanoes),
-      and, if configured, ships (AIS via aisstream.io) on its own schedule and pushes every
-      update to all connected browsers instantly, instead of each browser polling on its own.
+    - `GET /` — one cached OpenSky flight snapshot, CORS-enabled (10s edge cache).
     - `?demo=1` — simulated flights, for when OpenSky blocks or rate-limits the worker.
-  - `wrangler.jsonc`: Cloudflare Workers configuration, including the Durable Object binding.
+    - `GET /satellites` — a small set of satellite TLEs (ISS, Tiangong, etc.) from CelesTrak's
+      free, keyless catalog, cached for 5 minutes. The worker only fetches and parses the raw
+      TLE text; actual orbit propagation (SGP4) happens client-side.
+    - `POST /ask` — brokers a question + context to the Claude API server-side, so the API key
+      never reaches the browser. Returns 501 if `ANTHROPIC_API_KEY` isn't set, so the frontend
+      falls back to its local ($0) model instead of failing outright.
+  - `wrangler.jsonc`: Cloudflare Workers configuration.
 - **`world-model-proxy/sovereign-world-model/`**: Client dashboard with:
   - MapLibre GL rendering the [OpenFreeMap "Liberty"](https://openfreemap.org) style — free, no API key,
     full OpenStreetMap detail (roads, buildings, land use, water, place labels) plus extruded 3D buildings.
-  - Live flights, ships and hazards as distinct map layers (rotated altitude-colored aircraft,
-    ship positions, earthquakes sized by magnitude, wildfire/storm/volcano events), each with a
-    click-for-details popup. Connects to the worker's `/live` stream first, falling back to the
-    original HTTP polling if streaming can't be reached.
+  - Live flights as rotated, altitude-colored aircraft icons, and satellites as a separate layer
+    (positions computed client-side from CelesTrak TLEs via `satellite.js`/SGP4, refreshed every
+    few seconds) — each with a click-for-details popup.
   - Place search via OpenStreetMap's Nominatim geocoder (no key required).
-  - DuckDB-Wasm for local client-side SQL analytics (flights only — ships and hazards are kept
-    as lightweight in-memory state instead, since ships in particular can update many times a
-    second and re-inserting per update was exactly the performance bug fixed earlier for flights).
-  - In-browser AI (TinyLlama via `@xenova/transformers`) that picks which live dataset (flights,
-    ships, or hazards) to summarize based on the question, instead of dumping everything into
-    every prompt.
+  - DuckDB-Wasm for local client-side SQL analytics over the flight data.
+  - AI Q&A that prefers a hosted Claude model (via the worker's `/ask`, when configured) and
+    falls back to a local, $0, in-browser model (TinyLlama via `@xenova/transformers`) otherwise —
+    each answer is labeled `[Claude]` or `[Local]` so it's clear which one actually answered.
 
 ### A note on scope
 
-This aggregates *public infrastructure/environmental data* — flight positions, AIS ship
-reports, and public hazard advisories — the same kind of data FlightRadar24, MarineTraffic, or
-a weather app show. It does not track identifiable individuals or private vehicles by owner,
-and isn't intended to.
+This aggregates *public infrastructure/environmental data* — flight and satellite positions,
+the same kind of data FlightRadar24 or a satellite tracker shows. It does not track
+identifiable individuals or private vehicles by owner, and isn't intended to.
+
+### Known incomplete UI
+
+The dashboard's HUD/map still has **Ships** and **Hazards** rows/layers left over from a
+real-time streaming design (flights + ships/AIS + earthquakes/weather/wildfires pushed over a
+WebSocket via a Cloudflare Durable Object). That worker code caused a full outage after deploy
+(both the live and demo flight feeds went down) and was reverted; the frontend pieces were left
+in place since they degrade harmlessly (they just show "Not connected" / "—" — no data ever
+arrives), but they don't do anything until a working streaming or polling backend for those
+sources is rebuilt.
 
 ## Getting Started
 
@@ -51,21 +59,13 @@ To deploy to Cloudflare Workers:
 npm run deploy
 ```
 
-**Real-time streaming (`/live`) needs Durable Objects.** Cloudflare has historically required
-the $5/mo Workers Paid plan for Durable Objects and has been widening free-tier access to them
-over time — check your account before relying on it. If `wrangler deploy` rejects the
-`durable_objects` binding in `wrangler.jsonc`, your previous deployment is untouched (a failed
-deploy never replaces a running one), and the dashboard automatically falls back to the original
-HTTP polling — nothing else breaks.
-
-**Ships (AIS) are optional.** Without an API key, the ships layer just stays empty; everything
-else (flights, hazards) works regardless:
+**Hosted AI (`/ask`) is optional.** Without a key, the dashboard just uses the local model:
 ```bash
-npx wrangler secret put AISSTREAM_API_KEY   # get a free key at aisstream.io
+npx wrangler secret put ANTHROPIC_API_KEY
 ```
-Its exact WebSocket message schema was implemented from memory and hasn't been verified against
-aisstream.io's live docs — if ships never populate after setting the key, check the console for
-`AIS connection failed` and compare the subscribe message in `connectAis()` against their current docs.
+`/ask` uses `claude-opus-5`. It's a real, metered API — unlike everything else in this project,
+this is not $0. Keep an eye on usage if the site gets real traffic; there's no per-session cost
+cap built in yet (gods-eye-view caps its own hosted AI at $5/session, for comparison).
 
 ### 2. Sovereign World Model Dashboard
 
@@ -83,10 +83,10 @@ data is simulated, and if the live feed fails outright the panel shows the reaso
 `Feed failed: HTTP 429` (no console needed).
 
 If the AI panel shows `AI Query Failed: offset is out of bounds` (or a similar
-`onnxruntime`/typed-array error), the cached model file in the browser's Cache Storage is
-corrupted — usually from an earlier interrupted download. The page detects this and clears
-the cache and reloads automatically; if it doesn't, hard-refresh (Ctrl/Cmd+Shift+R) or clear
-the site's storage from devtools.
+`onnxruntime`/typed-array error) from the local model, the cached model file in the browser's
+Cache Storage is corrupted — usually from an earlier interrupted download. The page detects
+this and clears the cache and reloads automatically; if it doesn't, hard-refresh
+(Ctrl/Cmd+Shift+R) or clear the site's storage from devtools.
 
 ### 3. Deploy to Vercel
 
