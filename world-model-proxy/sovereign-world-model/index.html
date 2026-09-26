@@ -118,6 +118,7 @@
         // --- STATE ---
         let db, conn;
         let activeNow = 0; // aircraft in the most recent snapshot
+        let lastFeedWasDemo = false; // true if the last poll came from ?demo=1, explicit or auto-fallback
         let totalTracked = 0, uniqueFlights = 0; // rolling-window stats, read back from DuckDB
         const MAX_ROWS = 5000; // Kept low to guarantee no browser crashes
         let aiGenerator = null;
@@ -342,10 +343,29 @@
             const poll = async () => {
                 try {
                     if (!conn) return; // DuckDB still booting; next tick will catch up
-                    const response = await fetch(FEED_URL);
-                    if (!response.ok) throw new Error(`Proxy failed: HTTP ${response.status}`);
+
+                    // Try the real feed first; only fall back to the worker's own (tested)
+                    // ?demo=1 data if it fails, so the map is never empty because OpenSky is
+                    // rate-limiting or blocking the worker. Explicit ?demo=1 on the page always
+                    // skips straight to demo. Either way, the next poll tries the live feed
+                    // again, so it recovers on its own the moment OpenSky is reachable.
+                    let usingDemo = DEMO_MODE;
+                    let response;
+                    if (DEMO_MODE) {
+                        response = await fetch(FEED_URL);
+                    } else {
+                        try {
+                            response = await fetch(PROXY_WORKER_URL);
+                            if (!response.ok) throw new Error(`Proxy failed: HTTP ${response.status}`);
+                        } catch (liveErr) {
+                            console.warn("Live feed failed, falling back to the worker's demo data:", liveErr);
+                            usingDemo = true;
+                            response = await fetch(`${PROXY_WORKER_URL}${PROXY_WORKER_URL.includes('?') ? '&' : '?'}demo=1`);
+                        }
+                    }
+                    if (!response.ok) throw new Error(`Feed failed: HTTP ${response.status}`);
                     const data = await response.json();
-                    
+
                     if (data.states && Array.isArray(data.states)) {
                         // Process OpenSky data: [icao24, callsign, origin_country, time_position, last_contact,
                         //                        longitude, latitude, baro_altitude, on_ground, velocity, true_track, ...]
@@ -385,8 +405,13 @@
                         map.getSource('telemetry').setData({ type: 'FeatureCollection', features });
 
                         // Update HUD
+                        lastFeedWasDemo = usingDemo;
                         document.getElementById('db-status').innerText = `${totalTracked} Tracks (Max ${MAX_ROWS})`;
-                        document.getElementById('feed-status').innerText = DEMO_MODE ? `DEMO DATA (${activeNow} simulated)` : `Streaming Live (${activeNow} aircraft)`;
+                        document.getElementById('feed-status').innerText = !usingDemo
+                            ? `Streaming Live (${activeNow} aircraft)`
+                            : DEMO_MODE
+                                ? `DEMO DATA (${activeNow} simulated)`
+                                : `AUTO-FALLBACK DEMO (live feed down, ${activeNow} simulated)`;
                         document.getElementById('feed-status').classList.remove('error');
                         document.getElementById('feed-status').classList.add('highlight');
                     }
@@ -419,7 +444,7 @@
                 // 1. Build context from the stats already read back from DuckDB on the last poll.
                 // The feed is only current position snapshots (OpenSky state vectors) — no routes,
                 // origins or destinations — so the model is told plainly not to invent those.
-                const source = DEMO_MODE ? 'NOTE: this is simulated demo data, not real flights. ' : '';
+                const source = lastFeedWasDemo ? 'NOTE: this is simulated demo data, not real flights. ' : '';
                 const context = `${source}${activeNow} flights are currently active in the latest snapshot. ` +
                     `The rolling history holds ${totalTracked} total data points representing ${uniqueFlights} unique flights. ` +
                     `You only have each aircraft's current position and altitude — no flight routes, origin airports, or destination airports. ` +
