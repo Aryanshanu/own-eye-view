@@ -4,7 +4,13 @@ import {
 	waitOnExecutionContext,
 } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import worker, { OPENSKY_URL, demoStates } from "../src";
+import worker, {
+	OPENSKY_URL,
+	demoStates,
+	normalizeEarthquakes,
+	normalizeAlerts,
+	normalizeEonetEvents,
+} from "../src";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -86,5 +92,51 @@ describe("world-model-proxy", () => {
 		const a = demoStates(0).states[0];
 		const b = demoStates(10_000).states[0];
 		expect([a[5], a[6]]).not.toEqual([b[5], b[6]]);
+	});
+
+	it("/live without a WebSocket Upgrade header is rejected, not proxied blindly", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const response = await callWorker(new Request("http://example.com/live"));
+		expect(response.status).toBe(400);
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("hazard feed normalizers", () => {
+	it("normalizeEarthquakes extracts position, magnitude and place, dropping features without coordinates", () => {
+		const result = normalizeEarthquakes({
+			features: [
+				{ id: "us1", properties: { mag: 4.2, place: "10km N of Nowhere", time: 123 }, geometry: { coordinates: [78.1, 15.2, 10] } },
+				{ id: "us2", properties: { mag: 1.0, place: "no coords" }, geometry: { coordinates: [] } },
+			],
+		});
+		expect(result).toEqual([
+			{ id: "us1", mag: 4.2, place: "10km N of Nowhere", time: 123, url: null, lon: 78.1, lat: 15.2, depthKm: 10 },
+		]);
+	});
+
+	it("normalizeEarthquakes handles a missing/empty feed without throwing", () => {
+		expect(normalizeEarthquakes(null)).toEqual([]);
+		expect(normalizeEarthquakes({})).toEqual([]);
+	});
+
+	it("normalizeAlerts extracts event, severity and area", () => {
+		const result = normalizeAlerts({
+			features: [{ id: "a1", properties: { event: "Flood Warning", severity: "Severe", areaDesc: "Some County", headline: "h" } }],
+		});
+		expect(result).toEqual([{ id: "a1", event: "Flood Warning", severity: "Severe", area: "Some County", headline: "h" }]);
+	});
+
+	it("normalizeEonetEvents uses each event's most recent geometry point", () => {
+		const result = normalizeEonetEvents({
+			events: [{
+				id: "e1", title: "Wildfire X", categories: [{ title: "Wildfires" }],
+				geometry: [
+					{ coordinates: [10, 10], date: "2026-01-01" },
+					{ coordinates: [11, 12], date: "2026-01-02" },
+				],
+			}],
+		});
+		expect(result).toEqual([{ id: "e1", title: "Wildfire X", category: "Wildfires", lon: 11, lat: 12, date: "2026-01-02" }]);
 	});
 });

@@ -65,11 +65,13 @@
 
     <div id="hud">
         <h3 style="margin-top:0; color:#00ffcc; letter-spacing: 1px; font-size: 16px; border-bottom: 1px solid #00ffcc; padding-bottom: 8px;">📡 WORLD MODEL MATRIX</h3>
-        <div style="font-size: 11px; color: #777; margin: -6px 0 10px;">Map &amp; buildings: OpenStreetMap / OpenFreeMap · Flights: OpenSky</div>
+        <div style="font-size: 11px; color: #777; margin: -6px 0 10px;">Map: OpenStreetMap/OpenFreeMap · Flights: OpenSky · Ships: AIS · Hazards: USGS/NOAA/NASA</div>
         <div class="stat"><span>🧠 AI Node (TinyLlama):</span> <span id="ai-status" class="value">Initializing...</span></div>
         <div class="stat"><span>💾 Memory DB:</span> <span id="db-status" class="value">0 Records</span></div>
-        <div class="stat"><span>📡 Proxy Feed:</span> <span id="feed-status" class="value">Standby</span></div>
-        
+        <div class="stat"><span>📡 Feed:</span> <span id="feed-status" class="value">Standby</span></div>
+        <div class="stat"><span>🚢 Ships:</span> <span id="ships-status" class="value">Not connected</span></div>
+        <div class="stat"><span>🌎 Hazards:</span> <span id="hazards-status" class="value">—</span></div>
+
         <div style="margin-top: 15px; border-top: 1px solid #00ffcc; padding-top: 10px;">
             <div style="font-size: 12px; margin-bottom: 5px;">Ask the AI about the data:</div>
             <input type="text" id="ai-input" placeholder="e.g., How many flights are active?" disabled>
@@ -87,6 +89,9 @@
         <span><i style="background:#00ff66"></i> Low altitude</span>
         <span><i style="background:#00ffcc"></i> Cruise</span>
         <span><i style="background:#ff9900"></i> High altitude</span>
+        <span><i style="background:#3399ff"></i> Ship</span>
+        <span><i style="background:#ff3333"></i> Earthquake</span>
+        <span><i style="background:#cc66ff"></i> Wildfire/storm</span>
     </div>
 
     <div id="map"></div>
@@ -122,6 +127,16 @@
         let totalTracked = 0, uniqueFlights = 0; // rolling-window stats, read back from DuckDB
         const MAX_ROWS = 5000; // Kept low to guarantee no browser crashes
         let aiGenerator = null;
+        let httpPollHandle = null; // interval id for the HTTP-polling fallback, so it's never doubled up
+
+        // Ships (AIS) and hazards (earthquakes/weather alerts/NASA EONET events) are kept as
+        // plain in-memory state rather than round-tripped through DuckDB: ships can arrive many
+        // times a second per-vessel, and re-inserting per message is exactly the perf mistake
+        // fixed earlier for flights. The AI still gets a live summary of both (see buildAIContext).
+        let shipsMap = new Map(); // mmsi -> {mmsi, name, lat, lon, speed, course, lastSeen}
+        let shipsDirty = false;
+        let shipsStatus = 'not configured';
+        let hazardsState = { earthquakes: [], alerts: [], events: [] };
 
         // --- 1. INITIALIZE DUCKDB-WASM ---
         async function initDB() {
@@ -246,8 +261,64 @@
                         `Origin: ${p.country || 'Unknown'}`)
                     .addTo(map);
             });
-            map.on('mouseenter', 'telemetry-points', () => map.getCanvas().style.cursor = 'pointer');
-            map.on('mouseleave', 'telemetry-points', () => map.getCanvas().style.cursor = '');
+
+            // Ships (AIS), sized/colored distinctly from aircraft.
+            map.addSource('ships', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+            map.addLayer({
+                id: 'ships-points',
+                type: 'circle',
+                source: 'ships',
+                paint: { 'circle-radius': 4, 'circle-color': '#3399ff', 'circle-stroke-width': 1, 'circle-stroke-color': '#060913' }
+            });
+            map.on('click', 'ships-points', (e) => {
+                const p = e.features[0].properties;
+                popup.setLngLat(e.features[0].geometry.coordinates.slice())
+                    .setHTML(`<div id="popup-title">🚢 ${p.name || ('MMSI ' + p.mmsi)}</div>` +
+                        `Speed: ${p.speed != null ? p.speed + ' kn' : 'n/a'}<br>` +
+                        `Course: ${p.course != null ? Math.round(p.course) + '°' : 'n/a'}`)
+                    .addTo(map);
+            });
+
+            // Earthquakes (USGS), radius scaled by magnitude.
+            map.addSource('quakes', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+            map.addLayer({
+                id: 'quake-points',
+                type: 'circle',
+                source: 'quakes',
+                paint: {
+                    'circle-radius': ['interpolate', ['linear'], ['coalesce', ['get', 'mag'], 0], 0, 3, 8, 22],
+                    'circle-color': '#ff3333',
+                    'circle-opacity': 0.45,
+                    'circle-stroke-width': 1.5,
+                    'circle-stroke-color': '#ff3333'
+                }
+            });
+            map.on('click', 'quake-points', (e) => {
+                const p = e.features[0].properties;
+                popup.setLngLat(e.features[0].geometry.coordinates.slice())
+                    .setHTML(`<div id="popup-title">🌎 M${p.mag ?? '?'}</div>${p.place || ''}`)
+                    .addTo(map);
+            });
+
+            // Wildfires/storms/etc. (NASA EONET open events).
+            map.addSource('hazard-events', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+            map.addLayer({
+                id: 'hazard-event-points',
+                type: 'circle',
+                source: 'hazard-events',
+                paint: { 'circle-radius': 6, 'circle-color': '#cc66ff', 'circle-stroke-width': 1, 'circle-stroke-color': '#060913' }
+            });
+            map.on('click', 'hazard-event-points', (e) => {
+                const p = e.features[0].properties;
+                popup.setLngLat(e.features[0].geometry.coordinates.slice())
+                    .setHTML(`<div id="popup-title">${p.category || 'Event'}</div>${p.title || ''}`)
+                    .addTo(map);
+            });
+
+            ['telemetry-points', 'ships-points', 'quake-points', 'hazard-event-points'].forEach((layerId) => {
+                map.on('mouseenter', layerId, () => map.getCanvas().style.cursor = 'pointer');
+                map.on('mouseleave', layerId, () => map.getCanvas().style.cursor = '');
+            });
 
             startTelemetryLoop();
         });
@@ -330,14 +401,200 @@
             location.reload();
         }
 
-        // --- 4. TELEMETRY LOOP (Rolling Window) ---
-        async function startTelemetryLoop() {
-            if (!PROXY_CONFIGURED) {
-                document.getElementById('feed-status').innerText = "Proxy URL not set";
-                document.getElementById('feed-status').classList.add('error');
-                console.error("Set DEFAULT_PROXY_URL in index.html, or open this page with ?proxy=<your worker URL>");
+        // --- 4. LIVE DATA: real-time streaming (preferred) with HTTP-polling fallback ---
+
+        // Shared by both the streaming and polling paths, so there's exactly one
+        // implementation of "apply a flights snapshot" instead of two that can drift apart.
+        async function applyFlightsBatch(states, isDemo) {
+            if (!conn) return; // DuckDB still booting; the next update will catch up
+            // Process OpenSky data: [icao24, callsign, origin_country, time_position, last_contact,
+            //                        longitude, latitude, baro_altitude, on_ground, velocity, true_track, ...]
+            const freshBatch = (states || []).map(s => ({
+                id: s[1]?.trim() || s[0], // callsign or icao24
+                country: s[2],
+                lon: s[5],
+                lat: s[6],
+                alt: s[7],
+                speed: s[9],
+                track: s[10]
+            })).filter(s => s.lat !== null && s.lon !== null); // Filter invalid coords
+            activeNow = freshBatch.length;
+
+            // Append only the new batch (not the whole rolling window) so the SQL
+            // stays small and fast even as the window grows.
+            if (freshBatch.length > 0) {
+                const values = freshBatch.map(r =>
+                    `('${String(r.id).replace(/'/g, "''")}', ${r.lat}, ${r.lon}, ${r.alt || 0}, CURRENT_TIMESTAMP)`
+                ).join(', ');
+                await conn.query(`INSERT INTO telemetry (id, lat, lon, alt, timestamp) VALUES ${values}`);
+            }
+            // Trim anything older than MAX_ROWS off the front of the window by insert order.
+            await conn.query(`DELETE FROM telemetry WHERE seq <= (SELECT COALESCE(MAX(seq), 0) FROM telemetry) - ${MAX_ROWS}`);
+
+            const statsResult = await conn.query(`SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_flights FROM telemetry`);
+            const stats = statsResult.toArray()[0];
+            totalTracked = Number(stats.total);
+            uniqueFlights = Number(stats.unique_flights);
+
+            // Update Map (latest snapshot only, so each aircraft is drawn once, with a rotated icon)
+            const features = freshBatch.map(t => ({
+                type: 'Feature',
+                geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
+                properties: { id: t.id, alt: t.alt || 0, speed: t.speed, track: t.track, country: t.country }
+            }));
+            map.getSource('telemetry').setData({ type: 'FeatureCollection', features });
+
+            // Update HUD
+            lastFeedWasDemo = isDemo;
+            document.getElementById('db-status').innerText = `${totalTracked} Tracks (Max ${MAX_ROWS})`;
+            document.getElementById('feed-status').innerText = !isDemo
+                ? `Streaming Live (${activeNow} aircraft)`
+                : DEMO_MODE
+                    ? `DEMO DATA (${activeNow} simulated)`
+                    : `AUTO-FALLBACK DEMO (live feed down, ${activeNow} simulated)`;
+            document.getElementById('feed-status').classList.remove('error');
+            document.getElementById('feed-status').classList.add('highlight');
+        }
+
+        function applyShipUpdate(ship) {
+            if (!ship || ship.lat == null || ship.lon == null) return;
+            shipsMap.set(ship.mmsi, { ...ship, lastSeen: Date.now() });
+            shipsDirty = true;
+        }
+
+        function renderShipsStat() {
+            const el = document.getElementById('ships-status');
+            if (!el) return;
+            el.innerText = shipsMap.size > 0 ? `${shipsMap.size} tracked (AIS)` : shipsStatus;
+        }
+
+        // AIS can push many messages a second; batch the map/HUD update instead of doing it
+        // per-message (the same class of mistake fixed earlier for the flights insert).
+        setInterval(() => {
+            if (!shipsDirty) return;
+            shipsDirty = false;
+            const cutoff = Date.now() - 5 * 60 * 1000; // drop ships not heard from in 5 minutes
+            for (const [mmsi, s] of shipsMap) if (s.lastSeen < cutoff) shipsMap.delete(mmsi);
+
+            const features = [...shipsMap.values()].map(s => ({
+                type: 'Feature',
+                geometry: { type: 'Point', coordinates: [s.lon, s.lat] },
+                properties: { mmsi: s.mmsi, name: s.name, speed: s.speed, course: s.course }
+            }));
+            const source = map.getSource('ships');
+            if (source) source.setData({ type: 'FeatureCollection', features });
+            renderShipsStat();
+        }, 2000);
+
+        function applyHazardsSnapshot(msg) {
+            hazardsState = { earthquakes: msg.earthquakes || [], alerts: msg.alerts || [], events: msg.events || [] };
+
+            const quakeSource = map.getSource('quakes');
+            if (quakeSource) {
+                quakeSource.setData({
+                    type: 'FeatureCollection',
+                    features: hazardsState.earthquakes.map(q => ({
+                        type: 'Feature',
+                        geometry: { type: 'Point', coordinates: [q.lon, q.lat] },
+                        properties: { mag: q.mag || 0, place: q.place }
+                    }))
+                });
+            }
+            const eventSource = map.getSource('hazard-events');
+            if (eventSource) {
+                eventSource.setData({
+                    type: 'FeatureCollection',
+                    features: hazardsState.events.map(e => ({
+                        type: 'Feature',
+                        geometry: { type: 'Point', coordinates: [e.lon, e.lat] },
+                        properties: { title: e.title, category: e.category }
+                    }))
+                });
+            }
+
+            const el = document.getElementById('hazards-status');
+            if (el) el.innerText = `${hazardsState.earthquakes.length} quakes · ${hazardsState.alerts.length} alerts · ${hazardsState.events.length} events`;
+        }
+
+        function handleStreamMessage(msg) {
+            if (!msg || !msg.type) return;
+            if (msg.type === 'flights') {
+                applyFlightsBatch(msg.states, msg.source === 'demo').catch(err => console.error("Flight update failed:", err));
+            } else if (msg.type === 'ships') {
+                applyShipUpdate(msg.ship);
+            } else if (msg.type === 'hazards') {
+                applyHazardsSnapshot(msg);
+            } else if (msg.type === 'ais-status') {
+                shipsStatus = msg.status;
+                renderShipsStat();
+            }
+        }
+
+        // Turns the worker's HTTP(S) URL into its /live WebSocket URL, e.g.
+        // https://foo.workers.dev -> wss://foo.workers.dev/live
+        function buildLiveWsUrl(httpUrl) {
+            try {
+                const u = new URL(httpUrl);
+                u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+                u.pathname = '/live';
+                u.search = '';
+                return u.toString();
+            } catch (e) {
+                return null;
+            }
+        }
+
+        // Real-time push: one shared connection on the worker polls every upstream source
+        // and fans updates out over WebSocket, instead of every browser tab polling on its
+        // own. If it can't connect (e.g. Durable Objects unavailable on the worker's Cloudflare
+        // plan, or a network/proxy blocking WebSocket upgrades), falls back to HTTP polling —
+        // the same one that already worked before streaming existed.
+        function connectLiveStream() {
+            const wsUrl = buildLiveWsUrl(PROXY_WORKER_URL);
+            if (!wsUrl) { startHttpPolling(); return; }
+
+            document.getElementById('feed-status').innerText = "Connecting (stream)...";
+            let opened = false;
+            let ws;
+            try {
+                ws = new WebSocket(wsUrl);
+            } catch (err) {
+                console.warn("Could not open a live stream, falling back to polling:", err);
+                startHttpPolling();
                 return;
             }
+
+            const openTimeout = setTimeout(() => {
+                if (!opened) {
+                    console.warn("Live stream didn't open in time, falling back to polling");
+                    ws.close();
+                    startHttpPolling();
+                }
+            }, 6000);
+
+            ws.addEventListener('open', () => {
+                opened = true;
+                clearTimeout(openTimeout);
+                console.log("Live stream connected:", wsUrl);
+            });
+            ws.addEventListener('message', (event) => {
+                let msg;
+                try { msg = JSON.parse(event.data); } catch { return; }
+                handleStreamMessage(msg);
+            });
+            ws.addEventListener('error', (err) => console.warn("Live stream error:", err));
+            ws.addEventListener('close', () => {
+                clearTimeout(openTimeout);
+                if (!opened) return; // the open-timeout branch above already started polling
+                console.warn("Live stream closed; switching to HTTP polling for the rest of this session");
+                startHttpPolling();
+            });
+        }
+
+        // Original design: each browser polls the worker directly every 10s. Kept as the
+        // fallback for explicit ?demo=1 and for whenever streaming can't be reached.
+        function startHttpPolling() {
+            if (httpPollHandle) return; // already running; avoid a second interval stacking up
             document.getElementById('feed-status').innerText = "Connecting...";
 
             const poll = async () => {
@@ -365,55 +622,8 @@
                     }
                     if (!response.ok) throw new Error(`Feed failed: HTTP ${response.status}`);
                     const data = await response.json();
-
                     if (data.states && Array.isArray(data.states)) {
-                        // Process OpenSky data: [icao24, callsign, origin_country, time_position, last_contact,
-                        //                        longitude, latitude, baro_altitude, on_ground, velocity, true_track, ...]
-                        const freshBatch = data.states.map(s => ({
-                            id: s[1]?.trim() || s[0], // callsign or icao24
-                            country: s[2],
-                            lon: s[5],
-                            lat: s[6],
-                            alt: s[7],
-                            speed: s[9],
-                            track: s[10]
-                        })).filter(s => s.lat !== null && s.lon !== null); // Filter invalid coords
-                        activeNow = freshBatch.length;
-
-                        // Append only the new batch (not the whole rolling window) so the SQL
-                        // stays small and fast even as the window grows.
-                        if (freshBatch.length > 0) {
-                            const values = freshBatch.map(r =>
-                                `('${String(r.id).replace(/'/g, "''")}', ${r.lat}, ${r.lon}, ${r.alt || 0}, CURRENT_TIMESTAMP)`
-                            ).join(', ');
-                            await conn.query(`INSERT INTO telemetry (id, lat, lon, alt, timestamp) VALUES ${values}`);
-                        }
-                        // Trim anything older than MAX_ROWS off the front of the window by insert order.
-                        await conn.query(`DELETE FROM telemetry WHERE seq <= (SELECT COALESCE(MAX(seq), 0) FROM telemetry) - ${MAX_ROWS}`);
-
-                        const statsResult = await conn.query(`SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_flights FROM telemetry`);
-                        const stats = statsResult.toArray()[0];
-                        totalTracked = Number(stats.total);
-                        uniqueFlights = Number(stats.unique_flights);
-
-                        // Update Map (latest snapshot only, so each aircraft is drawn once, with a rotated icon)
-                        const features = freshBatch.map(t => ({
-                            type: 'Feature',
-                            geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
-                            properties: { id: t.id, alt: t.alt || 0, speed: t.speed, track: t.track, country: t.country }
-                        }));
-                        map.getSource('telemetry').setData({ type: 'FeatureCollection', features });
-
-                        // Update HUD
-                        lastFeedWasDemo = usingDemo;
-                        document.getElementById('db-status').innerText = `${totalTracked} Tracks (Max ${MAX_ROWS})`;
-                        document.getElementById('feed-status').innerText = !usingDemo
-                            ? `Streaming Live (${activeNow} aircraft)`
-                            : DEMO_MODE
-                                ? `DEMO DATA (${activeNow} simulated)`
-                                : `AUTO-FALLBACK DEMO (live feed down, ${activeNow} simulated)`;
-                        document.getElementById('feed-status').classList.remove('error');
-                        document.getElementById('feed-status').classList.add('highlight');
+                        await applyFlightsBatch(data.states, usingDemo);
                     }
                 } catch (e) {
                     const detail = (e && e.message) ? e.message : String(e);
@@ -425,7 +635,56 @@
             };
 
             poll();
-            setInterval(poll, 10000); // 10-second poll
+            httpPollHandle = setInterval(poll, 10000); // 10-second poll
+        }
+
+        function startTelemetryLoop() {
+            if (!PROXY_CONFIGURED) {
+                document.getElementById('feed-status').innerText = "Proxy URL not set";
+                document.getElementById('feed-status').classList.add('error');
+                console.error("Set DEFAULT_PROXY_URL in index.html, or open this page with ?proxy=<your worker URL>");
+                return;
+            }
+            if (DEMO_MODE) {
+                // Explicit ?demo=1 always uses plain HTTP polling against the worker's demo data.
+                startHttpPolling();
+                return;
+            }
+            connectLiveStream(); // falls back to startHttpPolling() itself if streaming can't be reached
+        }
+
+        // Builds the text handed to the model. Data has no routes/predictions/identities beyond
+        // what each public feed publishes — flight positions, AIS ship reports, and public hazard
+        // advisories — so the model is told plainly when it lacks something rather than guessing.
+        function buildAIContext(question) {
+            const q = (question || '').toLowerCase();
+            const flightsCtx = `${activeNow} flights are currently active in the latest snapshot; ` +
+                `the rolling history holds ${totalTracked} data points for ${uniqueFlights} unique flights. ` +
+                `Aircraft data has no routes, origin airports, or destination airports.`;
+            const shipsCtx = shipsMap.size > 0
+                ? `${shipsMap.size} ships are currently tracked via AIS.`
+                : `No ship (AIS) data is currently available (${shipsStatus}).`;
+            const topQuakes = [...hazardsState.earthquakes]
+                .sort((a, b) => (b.mag || 0) - (a.mag || 0))
+                .slice(0, 3)
+                .map(eq => `M${eq.mag ?? '?'} near ${eq.place}`)
+                .join('; ');
+            const hazardsCtx = `${hazardsState.earthquakes.length} recent earthquakes` +
+                (topQuakes ? ` (strongest: ${topQuakes})` : '') +
+                `, ${hazardsState.alerts.length} active weather alerts, ` +
+                `${hazardsState.events.length} tracked wildfire/storm/volcano events (NASA EONET).`;
+            const demoNote = lastFeedWasDemo ? 'NOTE: flight data is simulated demo data, not real. ' : '';
+
+            if (/\b(ship|vessel|boat|maritime|ais)\b/.test(q)) {
+                return `${demoNote}${shipsCtx} (Also available: ${flightsCtx} ${hazardsCtx})`;
+            }
+            if (/\b(quake|earthquake|seismic|tremor)\b/.test(q)) {
+                return `${demoNote}${hazardsCtx} (Also available: ${flightsCtx} ${shipsCtx})`;
+            }
+            if (/\b(storm|wildfire|fire|weather|alert|hazard|disaster|volcano)\b/.test(q)) {
+                return `${demoNote}${hazardsCtx} (Also available: ${flightsCtx} ${shipsCtx})`;
+            }
+            return `${demoNote}${flightsCtx} ${shipsCtx} ${hazardsCtx}`;
         }
 
         // --- 5. AI QUERY FUNCTION ---
@@ -441,17 +700,14 @@
             btn.disabled = true;
 
             try {
-                // 1. Build context from the stats already read back from DuckDB on the last poll.
-                // The feed is only current position snapshots (OpenSky state vectors) — no routes,
-                // origins or destinations — so the model is told plainly not to invent those.
-                const source = lastFeedWasDemo ? 'NOTE: this is simulated demo data, not real flights. ' : '';
-                const context = `${source}${activeNow} flights are currently active in the latest snapshot. ` +
-                    `The rolling history holds ${totalTracked} total data points representing ${uniqueFlights} unique flights. ` +
-                    `You only have each aircraft's current position and altitude — no flight routes, origin airports, or destination airports. ` +
-                    `If asked about a specific route (e.g. "flights from X to Y"), say plainly that this data has no route information.`;
+                // 1. Build context from whichever live source(s) the question is actually about.
+                // TinyLlama is small enough that dumping every dataset into every prompt makes
+                // it worse, not smarter — so this picks the relevant summary first (a cheap
+                // stand-in for real SQL tool-use, since ships/hazards live in JS, not DuckDB).
+                const context = buildAIContext(prompt);
 
                 // 2. Format prompt specifically for TinyLlama
-                const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
+                const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight, ship and natural-hazard data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
 
                 // 3. Generate response. Retry once with a smaller/greedy config if the first
                 // attempt fails (WASM inference can run out of memory on constrained devices).
