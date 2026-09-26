@@ -65,12 +65,13 @@
 
     <div id="hud">
         <h3 style="margin-top:0; color:#00ffcc; letter-spacing: 1px; font-size: 16px; border-bottom: 1px solid #00ffcc; padding-bottom: 8px;">📡 WORLD MODEL MATRIX</h3>
-        <div style="font-size: 11px; color: #777; margin: -6px 0 10px;">Map: OpenStreetMap/OpenFreeMap · Flights: OpenSky · Ships: AIS · Hazards: USGS/NOAA/NASA</div>
+        <div style="font-size: 11px; color: #777; margin: -6px 0 10px;">Map: OpenStreetMap/OpenFreeMap · Flights: OpenSky · Satellites: CelesTrak · AI: Claude (hosted) / TinyLlama (local)</div>
         <div class="stat"><span>🧠 AI Node (TinyLlama):</span> <span id="ai-status" class="value">Initializing...</span></div>
         <div class="stat"><span>💾 Memory DB:</span> <span id="db-status" class="value">0 Records</span></div>
         <div class="stat"><span>📡 Feed:</span> <span id="feed-status" class="value">Standby</span></div>
         <div class="stat"><span>🚢 Ships:</span> <span id="ships-status" class="value">Not connected</span></div>
         <div class="stat"><span>🌎 Hazards:</span> <span id="hazards-status" class="value">—</span></div>
+        <div class="stat"><span>🛰️ Satellites:</span> <span id="satellites-status" class="value">Loading…</span></div>
 
         <div style="margin-top: 15px; border-top: 1px solid #00ffcc; padding-top: 10px;">
             <div style="font-size: 12px; margin-bottom: 5px;">Ask the AI about the data:</div>
@@ -92,6 +93,7 @@
         <span><i style="background:#3399ff"></i> Ship</span>
         <span><i style="background:#ff3333"></i> Earthquake</span>
         <span><i style="background:#cc66ff"></i> Wildfire/storm</span>
+        <span><i style="background:#eeeeee"></i> Satellite</span>
     </div>
 
     <div id="map"></div>
@@ -103,6 +105,7 @@
     <script type="module">
         import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.0';
         import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm';
+        import * as satellite from 'https://cdn.jsdelivr.net/npm/satellite.js@5/+esm';
 
         // --- CONFIGURATION ---
         env.allowLocalModels = false; // Force download from Hugging Face CDN (saves your Vercel bandwidth)
@@ -137,6 +140,7 @@
         let shipsDirty = false;
         let shipsStatus = 'not configured';
         let hazardsState = { earthquakes: [], alerts: [], events: [] };
+        let satellitesTleSet = []; // [{name, satrec}], parsed once per TLE refresh (see startSatelliteTracking)
 
         // --- 1. INITIALIZE DUCKDB-WASM ---
         async function initDB() {
@@ -315,12 +319,28 @@
                     .addTo(map);
             });
 
-            ['telemetry-points', 'ships-points', 'quake-points', 'hazard-event-points'].forEach((layerId) => {
+            // Satellites (CelesTrak TLEs, propagated client-side — see startSatelliteTracking).
+            map.addSource('satellites', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+            map.addLayer({
+                id: 'satellite-points',
+                type: 'circle',
+                source: 'satellites',
+                paint: { 'circle-radius': 3, 'circle-color': '#eeeeee', 'circle-stroke-width': 1, 'circle-stroke-color': '#060913' }
+            });
+            map.on('click', 'satellite-points', (e) => {
+                const p = e.features[0].properties;
+                popup.setLngLat(e.features[0].geometry.coordinates.slice())
+                    .setHTML(`<div id="popup-title">🛰️ ${p.name}</div>Altitude: ${Math.round(p.altKm)} km`)
+                    .addTo(map);
+            });
+
+            ['telemetry-points', 'ships-points', 'quake-points', 'hazard-event-points', 'satellite-points'].forEach((layerId) => {
                 map.on('mouseenter', layerId, () => map.getCanvas().style.cursor = 'pointer');
                 map.on('mouseleave', layerId, () => map.getCanvas().style.cursor = '');
             });
 
             startTelemetryLoop();
+            startSatelliteTracking();
         });
 
         // --- OSM PLACE SEARCH (Nominatim) ---
@@ -638,6 +658,66 @@
             httpPollHandle = setInterval(poll, 10000); // 10-second poll
         }
 
+        // --- SATELLITES (CelesTrak TLEs, SGP4 propagation client-side via satellite.js) ---
+        // TLEs barely change minute to minute, so they're refreshed rarely; positions are
+        // recomputed locally every few seconds from the current TLE set for smooth motion,
+        // instead of re-fetching on every animation tick.
+        async function fetchSatelliteTles() {
+            try {
+                const res = await fetch(`${PROXY_WORKER_URL.replace(/\/$/, '')}/satellites`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                satellitesTleSet = (data.satellites || []).map(s => {
+                    try {
+                        return { name: s.name, satrec: satellite.twoline2satrec(s.line1, s.line2) };
+                    } catch (parseErr) {
+                        console.warn(`Could not parse TLE for ${s.name}:`, parseErr);
+                        return null;
+                    }
+                }).filter(Boolean);
+                const el = document.getElementById('satellites-status');
+                if (el) el.innerText = `${satellitesTleSet.length} tracked`;
+            } catch (err) {
+                console.warn("Satellite TLE fetch failed:", err);
+                const el = document.getElementById('satellites-status');
+                if (el) el.innerText = `Unavailable: ${err.message}`;
+            }
+        }
+
+        function renderSatellitePositions() {
+            if (!satellitesTleSet.length) return;
+            const now = new Date();
+            const gmst = satellite.gstime(now);
+            const features = [];
+            for (const sat of satellitesTleSet) {
+                try {
+                    const pv = satellite.propagate(sat.satrec, now);
+                    if (!pv || !pv.position) continue;
+                    const geo = satellite.eciToGeodetic(pv.position, gmst);
+                    features.push({
+                        type: 'Feature',
+                        geometry: { type: 'Point', coordinates: [satellite.degreesLong(geo.longitude), satellite.degreesLat(geo.latitude)] },
+                        properties: { name: sat.name, altKm: geo.height }
+                    });
+                } catch (propErr) {
+                    // One satellite's propagation failing (e.g. a decayed/invalid TLE)
+                    // shouldn't blank out the rest.
+                }
+            }
+            const source = map.getSource('satellites');
+            if (source) source.setData({ type: 'FeatureCollection', features });
+        }
+
+        function startSatelliteTracking() {
+            if (!PROXY_CONFIGURED) {
+                document.getElementById('satellites-status').innerText = "Proxy URL not set";
+                return;
+            }
+            fetchSatelliteTles().then(renderSatellitePositions);
+            setInterval(fetchSatelliteTles, 5 * 60 * 1000); // refresh TLEs every 5 minutes
+            setInterval(renderSatellitePositions, 3000); // smooth motion in between
+        }
+
         function startTelemetryLoop() {
             if (!PROXY_CONFIGURED) {
                 document.getElementById('feed-status').innerText = "Proxy URL not set";
@@ -673,43 +753,96 @@
                 (topQuakes ? ` (strongest: ${topQuakes})` : '') +
                 `, ${hazardsState.alerts.length} active weather alerts, ` +
                 `${hazardsState.events.length} tracked wildfire/storm/volcano events (NASA EONET).`;
+            const satNames = satellitesTleSet.slice(0, 5).map(s => s.name).join(', ');
+            const satellitesCtx = satellitesTleSet.length > 0
+                ? `${satellitesTleSet.length} satellites are being tracked (${satNames}), positions computed from public CelesTrak orbital data (SGP4), refreshed every few seconds.`
+                : `No satellite data is currently available.`;
             const demoNote = lastFeedWasDemo ? 'NOTE: flight data is simulated demo data, not real. ' : '';
 
             if (/\b(ship|vessel|boat|maritime|ais)\b/.test(q)) {
-                return `${demoNote}${shipsCtx} (Also available: ${flightsCtx} ${hazardsCtx})`;
+                return `${demoNote}${shipsCtx} (Also available: ${flightsCtx} ${hazardsCtx} ${satellitesCtx})`;
             }
             if (/\b(quake|earthquake|seismic|tremor)\b/.test(q)) {
-                return `${demoNote}${hazardsCtx} (Also available: ${flightsCtx} ${shipsCtx})`;
+                return `${demoNote}${hazardsCtx} (Also available: ${flightsCtx} ${shipsCtx} ${satellitesCtx})`;
             }
             if (/\b(storm|wildfire|fire|weather|alert|hazard|disaster|volcano)\b/.test(q)) {
-                return `${demoNote}${hazardsCtx} (Also available: ${flightsCtx} ${shipsCtx})`;
+                return `${demoNote}${hazardsCtx} (Also available: ${flightsCtx} ${shipsCtx} ${satellitesCtx})`;
             }
-            return `${demoNote}${flightsCtx} ${shipsCtx} ${hazardsCtx}`;
+            if (/\b(satellite|orbit|iss|space\s*station|tiangong)\b/.test(q)) {
+                return `${demoNote}${satellitesCtx} (Also available: ${flightsCtx} ${shipsCtx} ${hazardsCtx})`;
+            }
+            return `${demoNote}${flightsCtx} ${shipsCtx} ${hazardsCtx} ${satellitesCtx}`;
         }
 
         // --- 5. AI QUERY FUNCTION ---
+
+        // null = not yet tried this session; true/false once we learn whether the worker has
+        // ANTHROPIC_API_KEY configured. Brokered server-side (POST /ask) so the key never
+        // reaches the browser — the same pattern gods-eye-view uses for its own API keys.
+        let hostedAiAvailable = null;
+
+        async function askHosted(question, context) {
+            const url = `${PROXY_WORKER_URL.replace(/\/$/, '')}/ask`;
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question, context }),
+            });
+            if (res.status === 501) {
+                hostedAiAvailable = false; // no ANTHROPIC_API_KEY set on the worker — not an error
+                return null;
+            }
+            if (!res.ok) {
+                const body = await res.json().catch(() => ({}));
+                throw new Error(body.details || `Hosted AI failed: HTTP ${res.status}`);
+            }
+            hostedAiAvailable = true;
+            const data = await res.json();
+            return data.answer;
+        }
+
         window.queryAI = async function() {
             const input = document.getElementById('ai-input');
             const responseDiv = document.getElementById('ai-response');
             const btn = document.getElementById('ai-btn');
             const prompt = input.value.trim();
-            if (!prompt || !aiGenerator) return;
+            if (!prompt) return;
 
             responseDiv.innerText = "Thinking...";
             input.disabled = true;
             btn.disabled = true;
 
             try {
-                // 1. Build context from whichever live source(s) the question is actually about.
-                // TinyLlama is small enough that dumping every dataset into every prompt makes
-                // it worse, not smarter — so this picks the relevant summary first (a cheap
-                // stand-in for real SQL tool-use, since ships/hazards live in JS, not DuckDB).
+                // Build context from whichever live source(s) the question is actually about.
                 const context = buildAIContext(prompt);
 
-                // 2. Format prompt specifically for TinyLlama
+                // Prefer the hosted model (Claude, via the worker) when it's configured — it
+                // actually reasons over the context instead of TinyLlama's best-effort guesses.
+                // Falls back to the local model on any failure, or if it's simply not configured.
+                if (PROXY_CONFIGURED && hostedAiAvailable !== false) {
+                    try {
+                        const hostedAnswer = await askHosted(prompt, context);
+                        if (hostedAnswer != null) {
+                            responseDiv.innerText = `[Claude] ${hostedAnswer}`;
+                            responseDiv.style.color = "#00ffcc";
+                            return;
+                        }
+                        // hostedAnswer === null means "not configured" — fall through to local silently
+                    } catch (hostedErr) {
+                        console.warn("Hosted AI failed, falling back to the local model:", hostedErr);
+                    }
+                }
+
+                if (!aiGenerator) {
+                    responseDiv.innerText = "Local AI is still loading — try again in a moment.";
+                    responseDiv.style.color = "#ffaa00";
+                    return;
+                }
+
+                // Format prompt specifically for TinyLlama
                 const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight, ship and natural-hazard data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
 
-                // 3. Generate response. Retry once with a smaller/greedy config if the first
+                // Generate response. Retry once with a smaller/greedy config if the first
                 // attempt fails (WASM inference can run out of memory on constrained devices).
                 let result;
                 try {
@@ -721,7 +854,7 @@
 
                 // Extract the generated text
                 const answer = result[0].generated_text.split('<|assistant|>\n').pop().trim();
-                responseDiv.innerText = answer || "(empty response)";
+                responseDiv.innerText = `[Local] ${answer || "(empty response)"}`;
                 responseDiv.style.color = "#00ffcc";
             } catch (err) {
                 // Show the real error inline (not just in the console) so it's visible on
