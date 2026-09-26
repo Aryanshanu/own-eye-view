@@ -38,9 +38,16 @@ Set `DEFAULT_PROXY_URL` inside `index.html` to your deployed Worker URL. `npm ru
 it looks like `https://world-model-proxy.<your-subdomain>.workers.dev` (the name comes from `wrangler.jsonc`).
 To try a URL without editing the file, open the page with `?proxy=<worker-url>`.
 
-If OpenSky blocks or rate-limits the worker (the console shows `Proxy failed: HTTP 429` or `403`),
-add `?demo=1` to the page URL. The worker then returns 24 simulated aircraft over the bounding box,
-and the panel shows "DEMO DATA" so it is never mistaken for live traffic.
+If OpenSky blocks or rate-limits the worker, the panel now shows the reason inline, e.g.
+`Proxy Error: Proxy failed: HTTP 429` (no console needed). Add `?demo=1` to the page URL in
+that case: the worker then returns 24 simulated aircraft over the bounding box, and the panel
+shows "DEMO DATA" so it is never mistaken for live traffic.
+
+If the AI panel shows `AI Query Failed: offset is out of bounds` (or a similar
+`onnxruntime`/typed-array error), the cached model file in the browser's Cache Storage is
+corrupted — usually from an earlier interrupted download. The page detects this and clears
+the cache and reloads automatically; if it doesn't, hard-refresh (Ctrl/Cmd+Shift+R) or clear
+the site's storage from devtools.
 
 ### 3. Deploy to Vercel
 

@@ -296,11 +296,37 @@
                 document.getElementById('ai-btn').disabled = false;
                 document.getElementById('ai-response').innerText = "AI Ready. Ask a question.";
             } catch (err) {
+                const detail = (err && err.message) ? err.message : String(err);
                 document.getElementById('ai-status').innerText = "AI Load Failed";
                 document.getElementById('ai-status').classList.add('error');
-                document.getElementById('ai-response').innerText = "Check console (F12) for details.";
+                if (isCorruptedCacheError(detail)) {
+                    document.getElementById('ai-response').innerText =
+                        `Model cache looks corrupted (${detail}). Clearing it and reloading…`;
+                    setTimeout(clearModelCacheAndReload, 1500);
+                } else {
+                    document.getElementById('ai-response').innerText = `Load failed: ${detail}`;
+                }
                 console.error("AI Initialization Error:", err);
             }
+        }
+
+        // A handful of transformers.js/onnxruntime-web errors ("offset is out of bounds",
+        // "Invalid typed array length", etc.) mean a partially-downloaded or corrupted model
+        // file got stuck in the browser's Cache Storage (env.useBrowserCache = true below).
+        // The fix is to clear that cache and re-download, not to retry with the same bytes.
+        function isCorruptedCacheError(message) {
+            return /offset is out of bounds|invalid array buffer length|invalid typed array|out of memory/i.test(message || '');
+        }
+        async function clearModelCacheAndReload() {
+            try {
+                const keys = await caches.keys();
+                await Promise.all(
+                    keys.filter(k => /transformers|huggingface|xenova/i.test(k)).map(k => caches.delete(k))
+                );
+            } catch (e) {
+                console.warn("Could not clear model cache:", e);
+            }
+            location.reload();
         }
 
         // --- 4. TELEMETRY LOOP (Rolling Window) ---
@@ -365,7 +391,8 @@
                         document.getElementById('feed-status').classList.add('highlight');
                     }
                 } catch (e) {
-                    document.getElementById('feed-status').innerText = "Proxy Error";
+                    const detail = (e && e.message) ? e.message : String(e);
+                    document.getElementById('feed-status').innerText = `Proxy Error: ${detail}`;
                     document.getElementById('feed-status').classList.remove('highlight');
                     document.getElementById('feed-status').classList.add('error');
                     console.error("Telemetry Error:", e);
@@ -419,6 +446,13 @@
                 // Show the real error inline (not just in the console) so it's visible on
                 // mobile too, and so it can be reported back without opening devtools.
                 const detail = (err && err.message) ? err.message : String(err);
+                if (isCorruptedCacheError(detail)) {
+                    responseDiv.innerText = `Model cache looks corrupted (${detail}). Clearing it and reloading…`;
+                    responseDiv.style.color = "#ff9900";
+                    console.error("AI Query Error (corrupted cache):", err);
+                    setTimeout(clearModelCacheAndReload, 1500);
+                    return;
+                }
                 responseDiv.innerText = `AI Query Failed: ${detail}`;
                 responseDiv.style.color = "#ff3333";
                 console.error("AI Query Error:", err);
