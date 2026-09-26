@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sovereign World Model</title>
+    <!-- MapLibre GL CSS -->
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #060913; color: #00ffcc; font-family: 'Courier New', monospace; overflow: hidden; }
+        #map { width: 100vw; height: 100vh; position: absolute; z-index: 1; }
+        #hud { 
+            position: absolute; top: 20px; left: 20px; z-index: 10; 
+            background: rgba(6, 9, 19, 0.9); padding: 20px; border-radius: 8px; 
+            border: 1px solid #00ffcc; width: 340px; backdrop-filter: blur(10px); 
+            box-shadow: 0 0 20px rgba(0,255,204,0.15);
+        }
+        .stat { margin: 10px 0; font-size: 13px; display: flex; justify-content: space-between; align-items: center; }
+        .value { color: #ffffff; font-weight: bold; }
+        .highlight { color: #00ff66; }
+        .error { color: #ff3333; }
+        #ai-input { width: 100%; background: #0a0f19; border: 1px solid #00ffcc; color: #fff; padding: 8px; margin-top: 10px; border-radius: 4px; font-family: monospace; box-sizing: border-box; }
+        #ai-response { font-size: 12px; color: #aaa; margin-top: 8px; min-height: 40px; line-height: 1.4; }
+        button { width: 100%; background: #00ffcc; color: #060913; border: none; padding: 8px; font-weight: bold; cursor: pointer; margin-top: 5px; border-radius: 4px; }
+        button:hover { background: #00ccaa; }
+        button:disabled { background: #333; color: #666; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <h3 style="margin-top:0; color:#00ffcc; letter-spacing: 1px; font-size: 16px; border-bottom: 1px solid #00ffcc; padding-bottom: 8px;">📡 WORLD MODEL MATRIX</h3>
+        <div class="stat"><span>🧠 AI Node (Qwen2.5):</span> <span id="ai-status" class="value">Initializing...</span></div>
+        <div class="stat"><span>💾 Memory DB:</span> <span id="db-status" class="value">0 Records</span></div>
+        <div class="stat"><span>📡 Proxy Feed:</span> <span id="feed-status" class="value">Standby</span></div>
+        
+        <div style="margin-top: 15px; border-top: 1px solid #00ffcc; padding-top: 10px;">
+            <div style="font-size: 12px; margin-bottom: 5px;">Ask the AI about the data:</div>
+            <input type="text" id="ai-input" placeholder="e.g., How many flights are active?" disabled>
+            <button id="ai-btn" onclick="queryAI()" disabled>EXECUTE QUERY</button>
+            <div id="ai-response">Awaiting AI initialization...</div>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <!-- 1. MapLibre GL -->
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    
+    <!-- 2. Application Logic -->
+    <script type="module">
+        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.0';
+        import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm';
+
+        // --- CONFIGURATION ---
+        env.allowLocalModels = false; // Force download from Hugging Face CDN (saves your Vercel bandwidth)
+        env.useBrowserCache = true;
+        
+        // ⚠️ REPLACE THIS WITH YOUR ACTUAL WORKER URL FROM PHASE 1 ⚠️
+        const PROXY_WORKER_URL = "https://ganesh-world-model-proxy.yourname.workers.dev";  
+
+        // --- STATE ---
+        let db, conn;
+        let telemetryBuffer = [];
+        const MAX_ROWS = 5000; // Kept low to guarantee no browser crashes
+        let aiGenerator = null;
+
+        // --- 1. INITIALIZE DUCKDB-WASM ---
+        async function initDB() {
+            const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
+            const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
+            const worker_url = URL.createObjectURL(new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }));
+            const worker = new Worker(worker_url);
+            const logger = new duckdb.ConsoleLogger();
+            db = new duckdb.AsyncDuckDB(logger, worker);
+            await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+            URL.revokeObjectURL(worker_url);
+            conn = await db.connect();
+            
+            await conn.query(`CREATE TABLE IF NOT EXISTS telemetry (id VARCHAR, lat DOUBLE, lon DOUBLE, alt DOUBLE, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+            document.getElementById('db-status').innerText = "DuckDB-Wasm Ready";
+        }
+
+        // --- 2. INITIALIZE MAP ---
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: 'https://demotiles.maplibre.org/style.json', // Free, reliable baseline style
+            center: [8.5, 47.3], // Centered on the OpenSky bounding box (Switzerland/Europe)
+            zoom: 6,
+            pitch: 45
+        });
+        map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+        // Add a layer to render the aircraft as dots
+        map.on('load', () => {
+            map.addSource('telemetry', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+            map.addLayer({
+                id: 'telemetry-points',
+                type: 'circle',
+                source: 'telemetry',
+                paint: { 'circle-radius': 4, 'circle-color': '#00ffcc', 'circle-stroke-width': 1, 'circle-stroke-color': '#060913' }
+            });
+            startTelemetryLoop();
+        });
+
+        // --- 3. INITIALIZE AI (Qwen2.5-0.5B) ---
+        async function initAI() {
+            try {
+                document.getElementById('ai-status').innerText = "Downloading TinyLlama (~600MB)...";
+                // Using Qwen2.5-0.5B-Instruct: A highly capable, tiny Chinese open-source model
+                aiGenerator = await pipeline('text-generation', 'Xenova/TinyLlama-1.1B-Chat-v1.0');
+                
+                document.getElementById('ai-status').innerText = "Online (Local WebGPU/Wasm)";
+                document.getElementById('ai-status').classList.add('highlight');
+                document.getElementById('ai-input').disabled = false;
+                document.getElementById('ai-btn').disabled = false;
+                document.getElementById('ai-response').innerText = "AI Ready. Ask a question.";
+            } catch (err) {
+                document.getElementById('ai-status').innerText = "AI Load Failed";
+                document.getElementById('ai-status').classList.add('error');
+                document.getElementById('ai-response').innerText = "Check console (F12) for details.";
+                console.error("AI Initialization Error:", err);
+            }
+        }
+
+        // --- 4. TELEMETRY LOOP (Rolling Window) ---
+        async function startTelemetryLoop() {
+            document.getElementById('feed-status').innerText = "Connecting...";
+            
+            setInterval(async () => {
+                try {
+                    const response = await fetch(PROXY_WORKER_URL);
+                    if (!response.ok) throw new Error("Proxy failed");
+                    const data = await response.json();
+                    
+                    if (data.states && Array.isArray(data.states)) {
+                        // Process OpenSky data: [icao24, callsign, origin_country, time_position, last_contact, longitude, latitude, baro_altitude, ...]
+                        const freshBatch = data.states.map(s => ({
+                            id: s[1]?.trim() || s[0], // callsign or icao24
+                            lon: s[5],
+                            lat: s[6],
+                            alt: s[7]
+                        })).filter(s => s.lat !== null && s.lon !== null); // Filter invalid coords
+
+                        // Rolling Window Management
+                        telemetryBuffer.push(...freshBatch);
+                        if (telemetryBuffer.length > MAX_ROWS) {
+                            telemetryBuffer = telemetryBuffer.slice(-MAX_ROWS);
+                        }
+
+                        // Update DuckDB (Clear and reload for simplicity in Wasm)
+                        await conn.query(`DELETE FROM telemetry`);
+                        if (telemetryBuffer.length > 0) {
+                            const values = telemetryBuffer.map(r => `('${r.id}', ${r.lat}, ${r.lon}, ${r.alt || 0})`).join(', ');
+                            await conn.query(`INSERT INTO telemetry VALUES ${values}`);
+                        }
+
+                        // Update Map
+                        const features = telemetryBuffer.map(t => ({
+                            type: 'Feature',
+                            geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
+                            properties: { id: t.id }
+                        }));
+                        map.getSource('telemetry').setData({ type: 'FeatureCollection', features });
+
+                        // Update HUD
+                        document.getElementById('db-status').innerText = `${telemetryBuffer.length} Tracks (Max ${MAX_ROWS})`;
+                        document.getElementById('feed-status').innerText = "Streaming Live";
+                        document.getElementById('feed-status').classList.add('highlight');
+                    }
+                } catch (e) {
+                    document.getElementById('feed-status').innerText = "Proxy Error";
+                    document.getElementById('feed-status').classList.add('error');
+                    console.error("Telemetry Error:", e);
+                }
+            }, 10000); // 10-second poll
+        }
+
+        // --- 5. AI QUERY FUNCTION ---
+        window.queryAI = async function() {
+            const input = document.getElementById('ai-input');
+            const responseDiv = document.getElementById('ai-response');
+            const btn = document.getElementById('ai-btn');
+            const prompt = input.value.trim();
+            if (!prompt || !aiGenerator) return;
+
+            responseDiv.innerText = "Thinking...";
+            input.disabled = true;
+            btn.disabled = true;
+
+            try {
+                // 1. Get context from DuckDB
+                const countResult = await conn.query(`SELECT COUNT(*) as total, COUNT(DISTINCT id) as unique_flights FROM telemetry`);
+                const stats = countResult.toArray()[0];
+                const context = `Current database has ${stats.total} total data points representing ${stats.unique_flights} unique flights.`;
+
+                // 2. Format prompt specifically for TinyLlama
+                const promptText = `<|system|>\nYou are a helpful AI assistant analyzing live flight data. Answer concisely based ONLY on the provided context.\n<|user|>\nContext: ${context}. User Question: ${prompt}\n<|assistant|>\n`;
+
+                // 3. Generate response
+                const result = await aiGenerator(promptText, { max_new_tokens: 100, temperature: 0.1 });
+                
+                // Extract the generated text
+                const answer = result[0].generated_text.split('<|assistant|>\n').pop().trim();
+                responseDiv.innerText = answer;
+                responseDiv.style.color = "#00ffcc";
+            } catch (err) {
+                responseDiv.innerText = "AI Query Failed. Check console (F12).";
+                responseDiv.style.color = "#ff3333";
+                console.error("AI Query Error:", err);
+            } finally {
+                input.disabled = false;
+                btn.disabled = false;
+                input.focus();
+            }
+        };
+
+        // --- BOOT SEQUENCE ---
+        window.addEventListener('DOMContentLoaded', async () => {
+            await initDB();
+            await initAI();
+        });
+    </script>
+</body>
+</html>

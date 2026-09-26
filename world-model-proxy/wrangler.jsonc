@@ -1,0 +1,6 @@
+{
+  "name": "world-model-proxy",
+  "compatibility_date": "2026-09-24",
+  "main": "src/index.js" // or src/index.ts depending on your project
+  // ... rest of your config
+}

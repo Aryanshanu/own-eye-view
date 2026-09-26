@@ -1,0 +1,25 @@
+{
+	"name": "world-model-proxy",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-plugin": "^1.0.0",
+		"vitest": "~4.1.0",
+		"wrangler": "^4"
+	},
+	"description": "",
+	"main": "index.js",
+	"directories": {
+		"test": "test"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"type": "commonjs"
+}
