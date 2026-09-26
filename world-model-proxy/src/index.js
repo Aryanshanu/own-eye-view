@@ -9,7 +9,13 @@
  * - `npm run deploy` publishes to https://world-model-proxy.<your-subdomain>.workers.dev
  */
 
-import Anthropic from "@anthropic-ai/sdk";
+// NOTE: no top-level `import Anthropic from "@anthropic-ai/sdk"` here on purpose.
+// A previous version did that and it took the ENTIRE worker down (every route, not just
+// /ask) — almost certainly because the SDK needs a Node.js compatibility shim Workers
+// don't enable by default, and a failing top-level import crashes the whole script before
+// any request handler runs. It's imported lazily inside handleAsk() instead, wrapped in a
+// try/catch, so a failure there can only ever break /ask — everything else keeps working
+// regardless of whether this SDK loads at all.
 
 const ASK_MODEL = "claude-opus-5";
 const ASK_MAX_TOKENS = 300; // this is short Q&A over a data summary, not long-form generation
@@ -57,6 +63,7 @@ async function handleAsk(request, env) {
   }
 
   try {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
     const response = await client.messages.create({
       model: ASK_MODEL,
